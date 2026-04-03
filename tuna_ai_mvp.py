@@ -217,8 +217,8 @@ def fetch_live_zone_data(latitudes: List[float], longitudes: List[float]) -> pd.
 # -----------------------------
 with st.sidebar:
     st.header("Map Setup")
-    center_lat = st.number_input("Center latitude", value=0.0, format="%.4f")
-    center_lon = st.number_input("Center longitude", value=160.0, format="%.4f")
+  center_lat = st.number_input("Center latitude", value=20.0, format="%.4f")
+center_lon = st.number_input("Center longitude", value=-155.0, format="%.4f")
     zone_count = st.select_slider("Number of zones", options=[4, 9, 16, 25], value=9)
     spacing_deg = st.slider("Zone spacing (degrees)", min_value=0.1, max_value=1.0, value=0.35, step=0.05)
 
@@ -237,7 +237,13 @@ with st.sidebar:
 zone_grid = generate_zone_grid(center_lat, center_lon, zone_count, spacing_deg)
 live_df = fetch_live_zone_data(zone_grid["latitude"].tolist(), zone_grid["longitude"].tolist())
 zone_df = zone_grid.merge(live_df, on=["latitude", "longitude"], how="left")
-
+zone_df = zone_df.fillna({
+    "sea_surface_temperature": 24.0,
+    "ocean_current_velocity": 2.0,
+    "wave_height": 1.0,
+    "wind_speed_10m": 12.0,
+    "cloud_cover": 30.0,
+})
 zone_df["tuna_probability"] = zone_df.apply(
     lambda row: tuna_probability_from_live_data(row, bird_count, sonar_score, fad_nearby),
     axis=1,
