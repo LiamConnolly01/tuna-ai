@@ -1,391 +1,352 @@
 import math
-import random
-from dataclasses import dataclass
-from typing import Tuple
+from typing import List, Tuple
 
-import numpy as np
 import pandas as pd
+import plotly.express as px
+import requests
 import streamlit as st
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, classification_report
-from sklearn.model_selection import train_test_split
 
 
 # ============================================================
-# Tuna AI MVP
+# Tuna AI Live Ocean Zones MVP
 # ------------------------------------------------------------
-# A starter prototype for a tuna-detection decision engine.
-# This app does NOT use real vessel data yet.
-# It uses synthetic data shaped around realistic signals:
+# This version uses LIVE marine/weather data from Open-Meteo
+# to score candidate ocean zones around a selected center point.
+#
+# Live inputs used:
 # - sea surface temperature
-# - chlorophyll
-# - current speed
-# - time of day
+# - ocean current velocity
+# - wave height
+# - wind speed
+# - cloud cover
+#
+# Optional manual overlays:
 # - bird activity
-# - surface disturbance
-# - sonar biomass estimate
-# - fish depth
+# - sonar biomass
+# - FAD nearby
 #
 # Goal:
-# Convert fragmented sensor signals into a Tuna Probability Score.
+# Rank nearby search zones on an interactive map.
 # ============================================================
 
 
-@dataclass
-class TunaSignals:
-    sst_c: float
-    chlorophyll_mg_m3: float
-    current_speed_kts: float
-    hour_local: int
-    bird_count: int
-    surface_disturbance: float
-    sonar_biomass_score: float
-    fish_depth_m: float
-    fad_nearby: int
+st.set_page_config(page_title="Tuna AI Live Ocean Map", layout="wide")
+st.title("Tuna AI Live Ocean Map")
+st.caption("Interactive tuna-zone ranking using live marine and weather data.")
 
 
 # -----------------------------
-# Synthetic Data Generator
+# Helpers
 # -----------------------------
 def clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
-def tuna_probability_formula(row: pd.Series) -> float:
-    """
-    Hand-built scoring logic to generate synthetic labels.
-    Later, you can replace this with real outcomes from vessel trips.
-    Output is probability 0-1.
-    """
-    score = 0.0
-
-    # Tuna often prefer certain SST ranges depending on species/region.
-    # We use a broad warm-water preference curve.
-    temp_center = 24.5
-    temp_penalty = abs(row["sst_c"] - temp_center) * 0.35
-    score += 2.8 - temp_penalty
-
-    # Moderate chlorophyll can indicate productive feeding zones.
-    chl = row["chlorophyll_mg_m3"]
-    if 0.15 <= chl <= 0.75:
-        score += 1.6
-    elif 0.08 <= chl <= 1.0:
-        score += 0.8
-    else:
-        score -= 0.5
-
-    # Some current can be good; too much can hurt aggregation.
-    cur = row["current_speed_kts"]
-    if 0.5 <= cur <= 2.2:
-        score += 1.0
-    elif cur > 3.0:
-        score -= 0.7
-
-    # Dawn/morning often better surface signs.
-    hr = row["hour_local"]
-    if 5 <= hr <= 10:
-        score += 1.2
-    elif 11 <= hr <= 15:
-        score += 0.3
-    else:
-        score -= 0.2
-
-    # Birds are a strong indirect signal.
-    score += min(row["bird_count"] / 12.0, 2.0)
-
-    # Surface disturbance from drone/camera analysis.
-    score += row["surface_disturbance"] * 2.2
-
-    # Sonar biomass is a major signal.
-    score += row["sonar_biomass_score"] * 3.0
-
-    # Depth: shallower/mid-depth schools are easier to act on.
-    depth = row["fish_depth_m"]
-    if 10 <= depth <= 60:
-        score += 1.3
-    elif 60 < depth <= 120:
-        score += 0.6
-    else:
-        score -= 0.8
-
-    # FAD presence can increase probability of aggregation.
-    if row["fad_nearby"] == 1:
-        score += 1.0
-
-    # Convert score to probability with sigmoid.
-    prob = 1 / (1 + math.exp(-score + 4.5))
-    return float(clamp(prob, 0.0, 1.0))
+def score_sst(sst_c: float) -> float:
+    # Broad warm-water tuna preference curve centered near 24.5 C
+    penalty = abs(sst_c - 24.5) / 6.0
+    return clamp(1.0 - penalty, 0.0, 1.0)
 
 
-def generate_synthetic_dataset(n: int = 3000, seed: int = 42) -> pd.DataFrame:
-    random.seed(seed)
-    np.random.seed(seed)
-
-    data = []
-    for _ in range(n):
-        sst_c = np.random.normal(24.5, 2.8)
-        chlorophyll = abs(np.random.normal(0.35, 0.22))
-        current_speed = abs(np.random.normal(1.2, 0.9))
-        hour_local = np.random.randint(0, 24)
-        bird_count = max(0, int(np.random.normal(18, 14)))
-        surface_disturbance = clamp(np.random.beta(2.2, 3.3), 0.0, 1.0)
-        sonar_biomass_score = clamp(np.random.beta(2.0, 2.5), 0.0, 1.0)
-        fish_depth_m = clamp(abs(np.random.normal(55, 35)), 1, 250)
-        fad_nearby = np.random.binomial(1, 0.42)
-
-        row = {
-            "sst_c": round(float(sst_c), 2),
-            "chlorophyll_mg_m3": round(float(chlorophyll), 3),
-            "current_speed_kts": round(float(current_speed), 2),
-            "hour_local": int(hour_local),
-            "bird_count": int(bird_count),
-            "surface_disturbance": round(float(surface_disturbance), 3),
-            "sonar_biomass_score": round(float(sonar_biomass_score), 3),
-            "fish_depth_m": round(float(fish_depth_m), 1),
-            "fad_nearby": int(fad_nearby),
-        }
-        data.append(row)
-
-    df = pd.DataFrame(data)
-    df["tuna_prob_true"] = df.apply(tuna_probability_formula, axis=1)
-
-    # Simulated ground-truth catchable-tuna label.
-    # Some noise is added to avoid a perfectly clean synthetic dataset.
-    noise = np.random.normal(0, 0.08, size=len(df))
-    df["tuna_prob_noisy"] = np.clip(df["tuna_prob_true"] + noise, 0, 1)
-    df["tuna_present"] = (df["tuna_prob_noisy"] >= 0.55).astype(int)
-
-    return df
+def score_current(current_kmh: float) -> float:
+    # Mild-to-moderate currents are often more favorable than dead calm or extreme current
+    if 2.0 <= current_kmh <= 8.0:
+        return 1.0
+    if 1.0 <= current_kmh < 2.0 or 8.0 < current_kmh <= 12.0:
+        return 0.7
+    if 0.2 <= current_kmh < 1.0 or 12.0 < current_kmh <= 16.0:
+        return 0.4
+    return 0.15
 
 
-# -----------------------------
-# Model Training
-# -----------------------------
-def train_model(df: pd.DataFrame) -> Tuple[RandomForestClassifier, pd.DataFrame, pd.DataFrame, np.ndarray, np.ndarray]:
-    features = [
-        "sst_c",
-        "chlorophyll_mg_m3",
-        "current_speed_kts",
-        "hour_local",
-        "bird_count",
-        "surface_disturbance",
-        "sonar_biomass_score",
-        "fish_depth_m",
-        "fad_nearby",
-    ]
-    X = df[features]
-    y = df["tuna_present"]
+def score_wave_height(wave_height_m: float) -> float:
+    # Lower wave heights are easier for spotting and operations
+    if wave_height_m <= 1.0:
+        return 1.0
+    if wave_height_m <= 2.0:
+        return 0.75
+    if wave_height_m <= 3.0:
+        return 0.45
+    return 0.15
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.25, random_state=42, stratify=y
+
+def score_wind(wind_kmh: float) -> float:
+    if wind_kmh <= 15:
+        return 1.0
+    if wind_kmh <= 25:
+        return 0.7
+    if wind_kmh <= 35:
+        return 0.4
+    return 0.15
+
+
+def score_cloud(cloud_cover_pct: float) -> float:
+    # Lower cloud cover can help surface/drone visibility
+    if cloud_cover_pct <= 25:
+        return 1.0
+    if cloud_cover_pct <= 50:
+        return 0.7
+    if cloud_cover_pct <= 75:
+        return 0.45
+    return 0.2
+
+
+def tuna_probability_from_live_data(row: pd.Series, bird_count: int, sonar_score: float, fad_nearby: int) -> float:
+    sst = score_sst(row["sea_surface_temperature"])
+    current = score_current(row["ocean_current_velocity"])
+    wave = score_wave_height(row["wave_height"])
+    wind = score_wind(row["wind_speed_10m"])
+    cloud = score_cloud(row["cloud_cover"])
+
+    birds = clamp(bird_count / 40.0, 0.0, 1.0)
+    sonar = clamp(sonar_score, 0.0, 1.0)
+    fad = 1.0 if fad_nearby == 1 else 0.0
+
+    score = (
+        0.28 * sst
+        + 0.16 * current
+        + 0.12 * wave
+        + 0.12 * wind
+        + 0.08 * cloud
+        + 0.12 * birds
+        + 0.08 * sonar
+        + 0.04 * fad
     )
-
-    model = RandomForestClassifier(
-        n_estimators=250,
-        max_depth=10,
-        min_samples_split=6,
-        min_samples_leaf=3,
-        random_state=42,
-    )
-    model.fit(X_train, y_train)
-
-    return model, X_train, X_test, y_train.values, y_test.values
+    return clamp(score, 0.0, 1.0)
 
 
-# -----------------------------
-# Prediction Helpers
-# -----------------------------
 def probability_bucket(prob: float) -> str:
-    if prob >= 0.8:
+    if prob >= 0.75:
         return "HIGH"
-    if prob >= 0.55:
+    if prob >= 0.5:
         return "MEDIUM"
     return "LOW"
 
 
-def action_recommendation(prob: float, signals: TunaSignals) -> str:
-    if prob >= 0.8:
-        if signals.fish_depth_m <= 70:
-            return "High-probability tuna zone. Prioritize this location now."
-        return "High tuna probability, but fish are deeper. Monitor and prepare for movement upward."
-    if prob >= 0.55:
-        return "Moderate-probability zone. Validate with more drone or sonar passes before committing."
-    return "Low-probability zone. Skip for now and reallocate search time elsewhere."
+def recommendation_from_prob(prob: float) -> str:
+    if prob >= 0.75:
+        return "High-priority zone. Check immediately."
+    if prob >= 0.5:
+        return "Worth scouting. Validate with birds or sonar."
+    return "Lower priority. Re-check later or skip for now."
 
 
-def make_prediction(model: RandomForestClassifier, signals: TunaSignals) -> dict:
-    row = pd.DataFrame([
-        {
-            "sst_c": signals.sst_c,
-            "chlorophyll_mg_m3": signals.chlorophyll_mg_m3,
-            "current_speed_kts": signals.current_speed_kts,
-            "hour_local": signals.hour_local,
-            "bird_count": signals.bird_count,
-            "surface_disturbance": signals.surface_disturbance,
-            "sonar_biomass_score": signals.sonar_biomass_score,
-            "fish_depth_m": signals.fish_depth_m,
-            "fad_nearby": signals.fad_nearby,
-        }
-    ])
+def generate_zone_grid(center_lat: float, center_lon: float, zone_count: int, spacing_deg: float) -> pd.DataFrame:
+    side = int(math.sqrt(zone_count))
+    if side * side < zone_count:
+        side += 1
 
-    prob = float(model.predict_proba(row)[0][1])
-    bucket = probability_bucket(prob)
-    recommendation = action_recommendation(prob, signals)
-    return {
-        "probability": prob,
-        "bucket": bucket,
-        "recommendation": recommendation,
+    start_offset = -(side // 2)
+    rows = []
+    zone_id = 1
+    for i in range(side):
+        for j in range(side):
+            if zone_id > zone_count:
+                break
+            lat = center_lat + (start_offset + i) * spacing_deg
+            lon = center_lon + (start_offset + j) * spacing_deg
+            rows.append(
+                {
+                    "zone_id": f"Z{zone_id}",
+                    "latitude": round(lat, 4),
+                    "longitude": round(lon, 4),
+                }
+            )
+            zone_id += 1
+    return pd.DataFrame(rows)
+
+
+def parse_multi_location_response(payload):
+    if isinstance(payload, list):
+        return payload
+    return [payload]
+
+
+@st.cache_data(ttl=900)
+def fetch_live_zone_data(latitudes: List[float], longitudes: List[float]) -> pd.DataFrame:
+    lat_param = ",".join(str(x) for x in latitudes)
+    lon_param = ",".join(str(x) for x in longitudes)
+
+    marine_url = "https://marine-api.open-meteo.com/v1/marine"
+    marine_params = {
+        "latitude": lat_param,
+        "longitude": lon_param,
+        "current": "sea_surface_temperature,ocean_current_velocity,wave_height",
+        "cell_selection": "sea",
     }
 
+    weather_url = "https://api.open-meteo.com/v1/forecast"
+    weather_params = {
+        "latitude": lat_param,
+        "longitude": lon_param,
+        "current": "wind_speed_10m,cloud_cover",
+        "wind_speed_unit": "kmh",
+        "cell_selection": "sea",
+    }
+
+    marine_resp = requests.get(marine_url, params=marine_params, timeout=30)
+    marine_resp.raise_for_status()
+    marine_data = parse_multi_location_response(marine_resp.json())
+
+    weather_resp = requests.get(weather_url, params=weather_params, timeout=30)
+    weather_resp.raise_for_status()
+    weather_data = parse_multi_location_response(weather_resp.json())
+
+    rows = []
+    for marine_item, weather_item in zip(marine_data, weather_data):
+        current_marine = marine_item.get("current", {})
+        current_weather = weather_item.get("current", {})
+        rows.append(
+            {
+                "latitude": round(float(marine_item["latitude"]), 4),
+                "longitude": round(float(marine_item["longitude"]), 4),
+                "time": current_marine.get("time") or current_weather.get("time"),
+                "sea_surface_temperature": float(current_marine.get("sea_surface_temperature", float("nan"))),
+                "ocean_current_velocity": float(current_marine.get("ocean_current_velocity", float("nan"))),
+                "wave_height": float(current_marine.get("wave_height", float("nan"))),
+                "wind_speed_10m": float(current_weather.get("wind_speed_10m", float("nan"))),
+                "cloud_cover": float(current_weather.get("cloud_cover", float("nan"))),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
 
 # -----------------------------
-# Streamlit UI
+# Sidebar Controls
 # -----------------------------
-st.set_page_config(page_title="Tuna AI MVP", layout="wide")
-st.title("Tuna AI MVP Dashboard")
-st.caption("Prototype decision engine using synthetic tuna-search signals.")
-
 with st.sidebar:
-    st.header("Model Setup")
-    sample_size = st.slider("Synthetic training rows", min_value=500, max_value=10000, value=3000, step=500)
-    seed = st.number_input("Random seed", min_value=1, max_value=9999, value=42)
+    st.header("Map Setup")
+    center_lat = st.number_input("Center latitude", value=0.0, format="%.4f")
+    center_lon = st.number_input("Center longitude", value=160.0, format="%.4f")
+    zone_count = st.select_slider("Number of zones", options=[4, 9, 16, 25], value=9)
+    spacing_deg = st.slider("Zone spacing (degrees)", min_value=0.1, max_value=1.0, value=0.35, step=0.05)
+
+    st.header("Manual Search Overlays")
+    bird_count = st.slider("Bird activity score (count)", 0, 80, 20)
+    sonar_score = st.slider("Sonar biomass score", 0.0, 1.0, 0.45, 0.01)
+    fad_nearby = st.selectbox("FAD nearby", options=[0, 1], format_func=lambda x: "Yes" if x == 1 else "No")
+
+    st.header("About the Live Inputs")
+    st.write("This version uses live sea surface temperature, ocean current velocity, wave height, wind speed, and cloud cover.")
 
 
-@st.cache_data
-def get_data(sample_size: int, seed: int) -> pd.DataFrame:
-    return generate_synthetic_dataset(sample_size, seed)
+# -----------------------------
+# Build Zones + Fetch Live Data
+# -----------------------------
+zone_grid = generate_zone_grid(center_lat, center_lon, zone_count, spacing_deg)
+live_df = fetch_live_zone_data(zone_grid["latitude"].tolist(), zone_grid["longitude"].tolist())
+zone_df = zone_grid.merge(live_df, on=["latitude", "longitude"], how="left")
+
+zone_df["tuna_probability"] = zone_df.apply(
+    lambda row: tuna_probability_from_live_data(row, bird_count, sonar_score, fad_nearby),
+    axis=1,
+)
+zone_df["zone_rating"] = zone_df["tuna_probability"].apply(probability_bucket)
+zone_df["recommendation"] = zone_df["tuna_probability"].apply(recommendation_from_prob)
+zone_df["probability_pct"] = (zone_df["tuna_probability"] * 100).round(1)
+zone_df["marker_size"] = 16 + (zone_df["tuna_probability"] * 26)
+zone_df = zone_df.sort_values("tuna_probability", ascending=False).reset_index(drop=True)
 
 
-def format_pct(x: float) -> str:
-    return f"{x * 100:.1f}%"
-
-
-df = get_data(sample_size, int(seed))
-model, X_train, X_test, y_train, y_test = train_model(df)
-
-y_pred = model.predict(X_test)
-y_prob = model.predict_proba(X_test)[:, 1]
-acc = accuracy_score(y_test, y_pred)
-
+# -----------------------------
+# Top Metrics
+# -----------------------------
 col1, col2, col3, col4 = st.columns(4)
-col1.metric("Training rows", f"{len(df):,}")
-col2.metric("Model accuracy", f"{acc:.3f}")
-col3.metric("Positive tuna zones", f"{df['tuna_present'].mean() * 100:.1f}%")
-col4.metric("Avg true tuna probability", f"{df['tuna_prob_true'].mean() * 100:.1f}%")
+col1.metric("Zones scanned", len(zone_df))
+col2.metric("Best zone", zone_df.iloc[0]["zone_id"])
+col3.metric("Top tuna score", f"{zone_df.iloc[0]['probability_pct']:.1f}%")
+col4.metric("Data timestamp", str(zone_df.iloc[0]["time"]))
 
 st.divider()
 
-left, right = st.columns([1, 1])
+
+# -----------------------------
+# Interactive Map
+# -----------------------------
+st.subheader("Active Zone Map")
+fig = px.scatter_map(
+    zone_df,
+    lat="latitude",
+    lon="longitude",
+    color="zone_rating",
+    size="marker_size",
+    size_max=30,
+    hover_name="zone_id",
+    hover_data={
+        "probability_pct": True,
+        "sea_surface_temperature": ":.2f",
+        "ocean_current_velocity": ":.2f",
+        "wave_height": ":.2f",
+        "wind_speed_10m": ":.1f",
+        "cloud_cover": ":.1f",
+        "latitude": ":.4f",
+        "longitude": ":.4f",
+        "marker_size": False,
+    },
+    zoom=5,
+    height=650,
+)
+fig.update_layout(margin={"r": 0, "t": 0, "l": 0, "b": 0})
+st.plotly_chart(fig, use_container_width=True)
+
+st.divider()
+
+left, right = st.columns([1.15, 0.85])
 
 with left:
-    st.subheader("Live Prediction Input")
-
-    sst_c = st.slider("Sea Surface Temperature (°C)", 15.0, 32.0, 24.8, 0.1)
-    chlorophyll = st.slider("Chlorophyll (mg/m³)", 0.01, 2.00, 0.32, 0.01)
-    current_speed = st.slider("Current Speed (knots)", 0.0, 5.0, 1.1, 0.1)
-    hour_local = st.slider("Local Hour", 0, 23, 7)
-    bird_count = st.slider("Bird Count", 0, 120, 24)
-    surface_disturbance = st.slider("Surface Disturbance Score", 0.0, 1.0, 0.55, 0.01)
-    sonar_biomass_score = st.slider("Sonar Biomass Score", 0.0, 1.0, 0.62, 0.01)
-    fish_depth_m = st.slider("Detected Fish Depth (m)", 1.0, 250.0, 42.0, 1.0)
-    fad_nearby = st.selectbox("FAD Nearby", options=[0, 1], format_func=lambda x: "Yes" if x == 1 else "No")
-
-    signals = TunaSignals(
-        sst_c=sst_c,
-        chlorophyll_mg_m3=chlorophyll,
-        current_speed_kts=current_speed,
-        hour_local=hour_local,
-        bird_count=bird_count,
-        surface_disturbance=surface_disturbance,
-        sonar_biomass_score=sonar_biomass_score,
-        fish_depth_m=fish_depth_m,
-        fad_nearby=fad_nearby,
-    )
-
-    result = make_prediction(model, signals)
-    st.success(f"Tuna Probability Score: {format_pct(result['probability'])}")
-    st.write(f"**Zone Rating:** {result['bucket']}")
-    st.write(f"**Action:** {result['recommendation']}")
+    st.subheader("Ranked Live Zones")
+    display_cols = [
+        "zone_id",
+        "probability_pct",
+        "zone_rating",
+        "sea_surface_temperature",
+        "ocean_current_velocity",
+        "wave_height",
+        "wind_speed_10m",
+        "cloud_cover",
+        "latitude",
+        "longitude",
+        "recommendation",
+    ]
+    st.dataframe(zone_df[display_cols], use_container_width=True)
 
 with right:
-    st.subheader("Model Feature Importance")
-    importances = pd.DataFrame(
-        {
-            "feature": X_train.columns,
-            "importance": model.feature_importances_,
-        }
-    ).sort_values("importance", ascending=False)
-    st.bar_chart(importances.set_index("feature"))
+    st.subheader("Top Zone Breakdown")
+    best = zone_df.iloc[0]
+    st.success(f"Prioritize {best['zone_id']} — {best['probability_pct']:.1f}% tuna score")
+    st.write(f"**Recommendation:** {best['recommendation']}")
+    st.write(f"**Sea Surface Temp:** {best['sea_surface_temperature']:.2f} °C")
+    st.write(f"**Ocean Current:** {best['ocean_current_velocity']:.2f} km/h")
+    st.write(f"**Wave Height:** {best['wave_height']:.2f} m")
+    st.write(f"**Wind Speed:** {best['wind_speed_10m']:.1f} km/h")
+    st.write(f"**Cloud Cover:** {best['cloud_cover']:.1f}%")
+    st.write(f"**Coordinates:** {best['latitude']:.4f}, {best['longitude']:.4f}")
 
 st.divider()
 
-st.subheader("Synthetic Dataset Preview")
-st.dataframe(df.head(20), use_container_width=True)
+st.subheader("How this live version works")
+st.markdown(
+    """
+1. You choose a center point and number of candidate zones.
+2. The app builds a grid of ocean search zones around that point.
+3. It pulls live marine and weather conditions for each zone.
+4. It scores zones with a tuna-likelihood model.
+5. It ranks and maps the best zones.
 
-st.subheader("Search Zones Simulation")
-zone_count = st.slider("Number of candidate zones", 5, 25, 10)
-
-zone_rows = []
-for i in range(zone_count):
-    candidate = TunaSignals(
-        sst_c=round(random.uniform(18.0, 30.0), 2),
-        chlorophyll_mg_m3=round(random.uniform(0.03, 1.1), 3),
-        current_speed_kts=round(random.uniform(0.0, 4.0), 2),
-        hour_local=random.randint(0, 23),
-        bird_count=random.randint(0, 80),
-        surface_disturbance=round(random.uniform(0.0, 1.0), 3),
-        sonar_biomass_score=round(random.uniform(0.0, 1.0), 3),
-        fish_depth_m=round(random.uniform(5.0, 180.0), 1),
-        fad_nearby=random.randint(0, 1),
-    )
-    pred = make_prediction(model, candidate)
-    zone_rows.append(
-        {
-            "zone_id": f"Z{i+1}",
-            "lat": round(random.uniform(-8.0, 8.0), 4),
-            "lon": round(random.uniform(145.0, 165.0), 4),
-            "sst_c": candidate.sst_c,
-            "chlorophyll_mg_m3": candidate.chlorophyll_mg_m3,
-            "bird_count": candidate.bird_count,
-            "surface_disturbance": candidate.surface_disturbance,
-            "sonar_biomass_score": candidate.sonar_biomass_score,
-            "fish_depth_m": candidate.fish_depth_m,
-            "fad_nearby": candidate.fad_nearby,
-            "tuna_probability": pred["probability"],
-            "zone_rating": pred["bucket"],
-            "recommendation": pred["recommendation"],
-        }
-    )
-
-zone_df = pd.DataFrame(zone_rows).sort_values("tuna_probability", ascending=False)
-st.dataframe(
-    zone_df.style.format({"tuna_probability": "{:.1%}"}),
-    use_container_width=True,
-)
-
-st.subheader("Top Recommended Zone")
-best_zone = zone_df.iloc[0]
-st.info(
-    f"Prioritize {best_zone['zone_id']} | Probability: {best_zone['tuna_probability']:.1%} | "
-    f"Depth: {best_zone['fish_depth_m']} m | FAD Nearby: {'Yes' if best_zone['fad_nearby'] == 1 else 'No'}"
-)
-
-st.subheader("Classification Report")
-report = classification_report(y_test, y_pred, output_dict=True)
-report_df = pd.DataFrame(report).transpose()
-st.dataframe(report_df, use_container_width=True)
-
-st.markdown("""
-### How to upgrade this MVP
-1. Replace synthetic data with real trip logs, buoy data, or public ocean data.
-2. Add drone computer vision inputs such as bird counts and surface-disturbance detection.
-3. Replace the simple probability engine with a time-series model.
-4. Add zone ranking by fuel cost, distance, and vessel route.
-5. Add API ingestion for satellite SST, chlorophyll, and current maps.
+### Files needed for deployment
+Create a `requirements.txt` file with:
+```text
+streamlit
+pandas
+plotly
+requests
+```
 
 ### Run locally
 ```bash
-pip install streamlit pandas numpy scikit-learn
+pip install streamlit pandas plotly requests
 streamlit run tuna_ai_mvp.py
 ```
-""")
+"""
+)
